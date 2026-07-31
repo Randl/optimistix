@@ -12,12 +12,9 @@ import optimistix as optx
 import pytest
 
 from .helpers import (
-    beale,
-    bowl,
-    finite_difference_jvp,
     forward_only_fn_init_options_expected,
     golden_search_fn_y0_options_expected,
-    matyas,
+    implicit_minimise_jvp,
     make_nonreal,
     minimisation_fn_minima_init_args,
     minimisers,
@@ -76,13 +73,18 @@ def test_minimise(solver, _fn, minimum, init, args, options, dtype):
 )
 @pytest.mark.parametrize("solver", minimisers)
 @pytest.mark.parametrize("_fn, minimum, init, args", minimisation_fn_minima_init_args)
-def test_minimise_jvp(getkey, solver, _fn, minimum, init, args, options):
+@pytest.mark.parametrize("dtype", [jnp.float64, jnp.complex128])
+def test_minimise_jvp(getkey, solver, _fn, minimum, init, args, options, dtype):
+    init = make_nonreal(tree_as_dtype(init, dtype))
+    args = tree_as_dtype(args, dtype)
     if isinstance(solver, (optx.GradientDescent, optx.NonlinearCG)):
         max_steps = 100_000
         atol = rtol = 1e-2
     else:
         max_steps = 10_000
         atol = rtol = 1e-3
+    if dtype == jnp.complex128 and isinstance(solver, optx.NelderMead):
+        atol = rtol = 1e-2
     has_aux = random.choice([True, False])
     if has_aux:
         fn = lambda x, args: (_fn(x, args), smoke_aux)
@@ -90,8 +92,10 @@ def test_minimise_jvp(getkey, solver, _fn, minimum, init, args, options):
         fn = _fn
 
     dynamic_args, static_args = eqx.partition(args, eqx.is_array)
-    t_init = jtu.tree_map(lambda x: jr.normal(getkey(), x.shape), init)
-    t_dynamic_args = jtu.tree_map(lambda x: jr.normal(getkey(), x.shape), dynamic_args)
+    t_init = jtu.tree_map(lambda x: jr.normal(getkey(), x.shape, dtype=x.dtype), init)
+    t_dynamic_args = jtu.tree_map(
+        lambda x: jr.normal(getkey(), x.shape, dtype=x.dtype), dynamic_args
+    )
 
     def minimise(x, dynamic_args, *, adjoint):
         args = eqx.combine(dynamic_args, static_args)
@@ -116,26 +120,6 @@ def test_minimise_jvp(getkey, solver, _fn, minimum, init, args, options):
     out, t_out = eqx.filter_jit(ft.partial(eqx.filter_jvp, minimise))(
         (init, dynamic_args), (t_init, t_dynamic_args), adjoint=otd
     )
-    if _fn is bowl:
-        # Finite difference is very inaccurate on this problem.
-        expected_out = t_expected_out = jtu.tree_map(jnp.zeros_like, init)
-    elif _fn in (beale, matyas):
-        if isinstance(solver, optx.NonlinearCG):
-            eps = 1e-3
-            atol = rtol = 1e-2  # finite difference does a really bad job on this one
-        else:
-            eps = 1e-4
-        expected_out, t_expected_out = finite_difference_jvp(
-            minimise,
-            (init, dynamic_args),
-            (t_init, t_dynamic_args),
-            adjoint=otd,
-            eps=eps,
-        )
-    else:
-        expected_out, t_expected_out = finite_difference_jvp(
-            minimise, (init, dynamic_args), (t_init, t_dynamic_args), adjoint=otd
-        )
     # TODO(kidger): reinstate once we can do jvp-of-custom_vjp. Right now this errors
     #     because of the line searches used internally.
     #
@@ -146,10 +130,15 @@ def test_minimise_jvp(getkey, solver, _fn, minimum, init, args, options):
     # out2, t_out2 = eqx.filter_jvp(
     #     minimise, (init, dynamic_args), (t_init, t_dynamic_args), adjoint=dto,
     # )
-    assert tree_allclose(out, expected_out, atol=atol, rtol=rtol)
-    if not isinstance(solver, optx.NelderMead):
+    if isinstance(solver, optx.NelderMead):
         # Nelder-Mead does such a bad job that the finite-difference gradients are
         # noticeably different.
+        assert tree_allclose(_fn(out, args), minimum, atol=atol, rtol=rtol)
+    else:
+        t_expected_out = implicit_minimise_jvp(
+            _fn, out, args, eqx.combine(t_dynamic_args, static_args)
+        )
+        assert tree_allclose(_fn(out, args), minimum, atol=atol, rtol=rtol)
         assert tree_allclose(t_out, t_expected_out, atol=atol, rtol=rtol)
     # assert tree_allclose(expected_out2, expected_out, atol=atol, rtol=rtol)
     # assert tree_allclose(out2, expected_out, atol=atol, rtol=rtol)

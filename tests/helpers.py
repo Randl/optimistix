@@ -79,6 +79,52 @@ def finite_difference_jvp(fn, primals, tangents, eps=None, **kwargs):
     return out_ε, tangents_out
 
 
+def implicit_minimise_jvp(fn, y, args, t_args):
+    """Compute an argmin JVP from the objective's stationarity equation.
+
+    At a local minimiser ``y(args)``, the gradient satisfies
+    ``grad_y fn(y, args) = 0``. Differentiating this identity gives
+    ``Hessian_y(fn) @ dy = -d_args(grad_y(fn))``; this helper constructs both
+    sides with JAX and solves that linear system for ``dy``.
+
+    Complex PyTrees are first flattened into an explicit R² representation by
+    concatenating their real and imaginary components. Thus the Hessian is an
+    ordinary real matrix and the reference does not rely on JAX's convention for
+    complex gradients or on any complex-to-real Lineax operator. This also makes
+    the reference independent of the particular iterative minimiser under test.
+    """
+    flat_y, unravel_y = jfu.ravel_pytree(y)
+    if jnp.issubdtype(flat_y.dtype, jnp.complexfloating):
+        size = flat_y.size
+        real_y = jnp.concatenate((flat_y.real, flat_y.imag))
+
+        def from_real(flat_real_y):
+            flat_complex_y = jax.lax.complex(flat_real_y[:size], flat_real_y[size:])
+            return unravel_y(flat_complex_y)
+
+    else:
+        real_y = flat_y
+
+        def from_real(flat_real_y):
+            return unravel_y(flat_real_y)
+
+    def objective(flat_real_y, objective_args):
+        return fn(from_real(flat_real_y), objective_args)
+
+    grad_fn = jax.grad(objective)
+    hessian = jax.jacfwd(grad_fn)(real_y, args)
+    if jtu.tree_leaves(t_args):
+        _, rhs = jax.jvp(
+            lambda objective_args: grad_fn(real_y, objective_args),
+            (args,),
+            (t_args,),
+        )
+        tangent = jnp.linalg.solve(hessian, -rhs)
+    else:
+        tangent = jnp.zeros_like(real_y)
+    return from_real(tangent)
+
+
 #
 # NOTE: `GN` is shorthand for `gauss_newton`. We want to be sure we test every
 # branch of `GN=True` and `GN=False` for all of these solvers.
